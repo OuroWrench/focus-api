@@ -1,0 +1,226 @@
+"""
+Pruebas de todas las rutas de Focus! API.
+
+Ejecutar:  pytest -q
+Usan una base SQLite temporal, así que no tocan focus.db ni Azure SQL.
+"""
+import os
+import tempfile
+
+_tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+os.environ["DATABASE_URL"] = f"sqlite:///{_tmp.name}"
+os.environ.pop("AZURE_SQL_SERVER", None)
+os.environ.pop("AZURE_STORAGE_CONNECTION_STRING", None)
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from main import app  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+def registrar(client, email, nombre="Prueba"):
+    r = client.post("/auth/registro", json={"email": email, "nombre": nombre, "password": "secreto123"})
+    assert r.status_code == 201, r.text
+    return {"X-Usuario-Id": str(r.json()["id"])}
+
+
+@pytest.fixture(scope="module")
+def u1(client):
+    return registrar(client, "uno@focus.app", "Usuario Uno")
+
+
+@pytest.fixture(scope="module")
+def u2(client):
+    return registrar(client, "dos@focus.app", "Usuario Dos")
+
+
+def test_salud(client):
+    r = client.get("/salud")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+
+def test_registro_y_login(client, u1):
+    assert client.post("/auth/registro", json={"email": "UNO@focus.app", "nombre": "x", "password": "secreto123"}).status_code == 409
+    r = client.post("/auth/login", json={"email": "uno@focus.app", "password": "secreto123"})
+    assert r.status_code == 200 and r.json()["usuario_id"] == int(u1["X-Usuario-Id"])
+    assert client.post("/auth/login", json={"email": "uno@focus.app", "password": "malo"}).status_code == 401
+    assert client.post("/auth/registro", json={"email": "no-es-email", "nombre": "x", "password": "secreto123"}).status_code == 422
+
+
+def test_header_obligatorio(client):
+    assert client.get("/apps").status_code == 422
+    assert client.get("/apps", headers={"X-Usuario-Id": "999"}).status_code == 401
+
+
+def test_usuario_perfil_y_foto(client, u1):
+    r = client.get("/usuarios/me", headers=u1)
+    assert r.status_code == 200 and r.json()["email"] == "uno@focus.app"
+    r = client.put("/usuarios/me", headers=u1, json={"seudonimo": "piedrita"})
+    assert r.status_code == 200 and r.json()["seudonimo"] == "piedrita"
+    url = "https://focusstorage.blob.core.windows.net/fotos/u1.jpg"
+    r = client.post("/usuarios/me/foto", headers=u1, json={"url": url})
+    assert r.status_code == 201 and r.json()["foto_url"] == url
+    assert client.post("/usuarios/me/foto", headers=u1, json={"url": "no-es-url"}).status_code == 422
+    # sin Blob configurado -> 503; formato inválido -> 415
+    r = client.post("/usuarios/me/foto/archivo", headers=u1, files={"archivo": ("f.png", b"\x89PNG", "image/png")})
+    assert r.status_code == 503
+    r = client.post("/usuarios/me/foto/archivo", headers=u1, files={"archivo": ("f.txt", b"hola", "text/plain")})
+    assert r.status_code == 415
+
+
+def test_apps_crud_y_numeracion_por_usuario(client, u1, u2):
+    a1 = client.post("/apps", headers=u1, json={"nombre": "Instagram", "paquete": "com.instagram.android", "categoria": "redes", "limite_aperturas": 5})
+    assert a1.status_code == 201 and a1.json()["numero"] == 1
+    a2 = client.post("/apps", headers=u1, json={"nombre": "TikTok", "paquete": "com.zhiliad.tiktok"})
+    assert a2.json()["numero"] == 2
+    # el usuario 2 empieza su propia numeración
+    b1 = client.post("/apps", headers=u2, json={"nombre": "YouTube", "paquete": "com.google.youtube"})
+    assert b1.json()["numero"] == 1
+    assert client.get("/apps/1", headers=u1).json()["nombre"] == "Instagram"
+    assert client.get("/apps/1", headers=u2).json()["nombre"] == "YouTube"
+    assert len(client.get("/apps", headers=u1).json()) == 2
+    r = client.put("/apps/1", headers=u1, json={"limite_aperturas": 3})
+    assert r.status_code == 200 and r.json()["limite_aperturas"] == 3 and r.json()["nombre"] == "Instagram"
+    assert client.get("/apps/99", headers=u1).status_code == 404
+    assert client.delete("/apps/2", headers=u1).status_code == 204
+    assert client.get("/apps/2", headers=u1).status_code == 404
+    # el siguiente número no reutiliza huecos intermedios incorrectamente
+    assert client.post("/apps", headers=u1, json={"nombre": "X", "paquete": "com.x"}).json()["numero"] == 2
+
+
+def test_franjas_crud(client):
+    r = client.post("/franjas/generar", json={"fecha": "2026-10-19"})
+    assert r.status_code == 201 and len(r.json()) == 12
+    assert len(client.post("/franjas/generar", json={"fecha": "2026-10-19"}).json()) == 12  # idempotente
+    assert len(client.get("/franjas", params={"fecha": "2026-10-19"}).json()) == 12
+    r = client.post("/franjas", json={"fecha": "2026-10-20", "hora_inicio": "08:00", "hora_fin": "10:00"})
+    assert r.status_code == 201
+    fid = r.json()["id"]
+    assert client.post("/franjas", json={"fecha": "2026-10-20", "hora_inicio": "08:00", "hora_fin": "10:00"}).status_code == 409
+    assert client.post("/franjas", json={"fecha": "2026-10-20", "hora_inicio": "10:00", "hora_fin": "08:00"}).status_code == 422
+    assert client.put(f"/franjas/{fid}", json={"hora_fin": "09:30"}).json()["hora_fin"] == "09:30:00"
+    assert client.get(f"/franjas/{fid}").status_code == 200
+    assert client.delete(f"/franjas/{fid}").status_code == 204
+    assert client.get(f"/franjas/{fid}").status_code == 404
+
+
+def test_eventos_crud_e_integridad(client, u1):
+    franja = client.get("/franjas", params={"fecha": "2026-10-19"}).json()[4]  # 08:00-10:00
+    datos = {"app_numero": 1, "franja_id": franja["id"], "inicio": "2026-10-19T08:15:00", "fin": "2026-10-19T08:30:00"}
+    r = client.post("/eventos", headers=u1, json=datos)
+    assert r.status_code == 201 and r.json()["duracion_seg"] == 900 and r.json()["app_numero"] == 1
+    assert client.post("/eventos", headers=u1, json={**datos, "app_numero": 50}).status_code == 404
+    assert client.post("/eventos", headers=u1, json={**datos, "franja_id": 9999}).status_code == 404
+    assert client.post("/eventos", headers=u1, json={**datos, "fin": "2026-10-19T08:00:00"}).status_code == 422
+    assert len(client.get("/eventos", headers=u1, params={"franja_id": franja["id"]}).json()) == 1
+    assert len(client.get("/eventos", headers=u1, params={"app_numero": 1}).json()) == 1
+    r = client.put("/eventos/1", headers=u1, json={"fin": "2026-10-19T08:45:00"})
+    assert r.status_code == 200 and r.json()["duracion_seg"] == 1800
+    assert client.get("/eventos/1", headers=u1).status_code == 200
+    # la app 1 ya tiene historial -> no se puede borrar
+    assert client.delete("/apps/1", headers=u1).status_code == 409
+    # la franja tiene eventos -> no se puede borrar
+    assert client.delete(f"/franjas/{franja['id']}").status_code == 409
+    client.post("/eventos", headers=u1, json=datos)
+    assert client.delete("/eventos/2", headers=u1).status_code == 204
+
+
+def test_pausas_septima_pausa(client, u1, u2):
+    for i in range(7):
+        r = client.post("/pausas", headers=u1, json={"app_numero": 1, "tipo": "media", "duracion_seg": 10 + i, "ignorada": i % 2 == 0})
+        assert r.status_code == 201
+    client.post("/pausas", headers=u2, json={"app_numero": 1, "tipo": "leve", "duracion_seg": 5})
+    r = client.get("/pausas/7", headers=u1)
+    assert r.status_code == 200 and r.json()["numero"] == 7 and r.json()["duracion_seg"] == 16
+    assert client.get("/pausas/7", headers=u2).status_code == 404  # el usuario 2 solo tiene 1
+    assert client.get("/pausas/1", headers=u2).json()["tipo"] == "leve"
+    assert client.post("/pausas", headers=u1, json={"app_numero": 1, "tipo": "extrema", "duracion_seg": 5}).status_code == 422
+    assert client.put("/pausas/7", headers=u1, json={"ignorada": True}).json()["ignorada"] is True
+    assert client.delete("/pausas/6", headers=u1).status_code == 204
+    assert len(client.get("/pausas", headers=u1).json()) == 6
+
+
+def test_planes_y_ajustes(client, u1):
+    r = client.post("/planes", headers=u1, json={"fecha_inicio": "2026-10-19", "limite_base": 240})
+    assert r.status_code == 201 and r.json()["numero"] == 1
+    assert client.get("/planes/activo", headers=u1).json()["numero"] == 1
+    client.post("/planes", headers=u1, json={"fecha_inicio": "2026-10-26", "limite_base": 200})
+    planes = client.get("/planes", headers=u1).json()
+    assert [p["activo"] for p in planes] == [False, True]
+    assert client.get("/planes/activo", headers=u1).json()["numero"] == 2
+    # ajuste sin cambio_pct -> lo calcula con las reglas difusas
+    r = client.post("/planes/2/ajustes", headers=u1, json={"semana": 2, "uso_meta": 210, "adherencia": 0.92})
+    assert r.status_code == 201 and r.json()["cambio_pct"] == -10.0
+    assert client.get("/planes/2", headers=u1).json()["semana_actual"] == 2
+    assert client.post("/planes/2/ajustes", headers=u1, json={"semana": 2, "uso_meta": 210, "adherencia": 0.5}).status_code == 409
+    r = client.put("/planes/2/ajustes/2", headers=u1, json={"adherencia": 0.6})
+    assert r.json()["cambio_pct"] == 0.0
+    assert len(client.get("/planes/2/ajustes", headers=u1).json()) == 1
+    assert client.get("/planes/2/ajustes/2", headers=u1).status_code == 200
+    assert client.put("/planes/2", headers=u1, json={"limite_base": 180}).json()["limite_base"] == 180
+    assert client.delete("/planes/2/ajustes/2", headers=u1).status_code == 204
+    client.post("/planes/2/ajustes", headers=u1, json={"semana": 3, "uso_meta": 190, "adherencia": 0.8})
+    assert client.delete("/planes/2", headers=u1).status_code == 204  # borra también sus ajustes
+    assert client.get("/planes/activo", headers=u1).status_code == 404
+
+
+def test_dominios(client, u1):
+    r = client.post("/dominios", headers=u1, json={"dominio": "YouTube.com"})
+    assert r.status_code == 201 and r.json()["dominio"] == "youtube.com"
+    assert client.post("/dominios", headers=u1, json={"dominio": "youtube.com"}).status_code == 409
+    assert client.post("/dominios", headers=u1, json={"dominio": "no valido"}).status_code == 422
+    assert client.put("/dominios/1", headers=u1, json={"activo": False}).json()["activo"] is False
+    assert client.get("/dominios/1", headers=u1).status_code == 200
+    assert len(client.get("/dominios", headers=u1).json()) == 1
+    assert client.delete("/dominios/1", headers=u1).status_code == 204
+
+
+def test_sesiones_foco(client, u1):
+    r = client.post("/sesiones-foco", headers=u1, json={"duracion_min": 25})
+    assert r.status_code == 201 and r.json()["fin"] is None
+    r = client.put("/sesiones-foco/1", headers=u1, json={"completada": True})
+    assert r.json()["completada"] is True and r.json()["fin"] is not None
+    client.post("/sesiones-foco", headers=u1, json={"duracion_min": 50})
+    assert len(client.get("/sesiones-foco", headers=u1).json()) == 2
+    assert client.get("/sesiones-foco/2", headers=u1).status_code == 200
+    assert client.delete("/sesiones-foco/2", headers=u1).status_code == 204
+
+
+def test_tokens_dispositivo(client, u1, u2):
+    r = client.post("/tokens-dispositivo", headers=u1, json={"token": "fcm-token-0123456789"})
+    assert r.status_code == 201 and r.json()["plataforma"] == "android"
+    assert client.post("/tokens-dispositivo", headers=u2, json={"token": "fcm-token-0123456789"}).status_code == 409
+    assert client.put("/tokens-dispositivo/1", headers=u1, json={"activo": False}).json()["activo"] is False
+    assert client.get("/tokens-dispositivo/1", headers=u1).status_code == 200
+    assert len(client.get("/tokens-dispositivo", headers=u1).json()) == 1
+    assert client.delete("/tokens-dispositivo/1", headers=u1).status_code == 204
+
+
+def test_estadisticas(client, u1, u2):
+    e = client.get("/estadisticas", headers=u1).json()
+    assert e["total_apps"] == 2 and e["total_eventos"] == 1 and e["minutos_uso"] == 30.0
+    assert e["total_pausas"] == 6 and e["pausas_ignoradas"] == 4
+    assert e["sesiones_foco_completadas"] == 1 and e["minutos_foco_completados"] == 25
+    filtrado = client.get("/estadisticas", headers=u1, params={"desde": "2026-11-01"}).json()
+    assert filtrado["total_eventos"] == 0
+    assert client.get("/estadisticas", headers=u2).json()["total_apps"] == 1
+
+
+def test_desactivar_cuenta(client):
+    h = registrar(client, "tres@focus.app")
+    assert client.delete("/usuarios/me", headers=h).status_code == 204
+    assert client.get("/usuarios/me", headers=h).status_code == 401
+    assert client.post("/auth/login", json={"email": "tres@focus.app", "password": "secreto123"}).status_code == 401
+
+
+def test_conteo_de_rutas(client):
+    rutas = client.get("/openapi.json").json()["paths"]
+    operaciones = sum(len(v) for v in rutas.values())
+    assert operaciones >= 12

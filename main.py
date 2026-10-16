@@ -1,317 +1,87 @@
-# main.py — Focus! API (FastAPI + SQLAlchemy)
-import os
-from datetime import datetime, date
-from typing import List, Optional
+"""
+Focus! API — backend de la app Android Focus! (Servicios Cloud, UAQ).
 
-from fastapi import FastAPI, Depends, HTTPException, status, Header
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Date, ForeignKey
-from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
-from pydantic import BaseModel
+Arquitectura en capas:
+    Controller (rutas)  ->  Service (reglas de negocio)  ->  Repository (SQLAlchemy)  ->  Azure SQL / SQLite
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./focus.db")
+Ejecutar en local:
+    uvicorn main:app --reload
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
+En Azure App Service (comando de inicio):
+    gunicorn -w 2 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 main:app
+"""
+import logging
+from contextlib import asynccontextmanager
 
-# ---------------- MODELOS ----------------
-class Usuario(Base):
-    __tablename__ = "usuario"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True)
-    nombre = Column(String)
-    password_hash = Column(String)
-    fecha_registro = Column(DateTime, default=datetime.utcnow)
-    seudonimo = Column(String, nullable=True)
-    activo = Column(Boolean, default=True)
-    foto_url = Column(String, nullable=True)
-    apps = relationship("App", back_populates="usuario")
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 
-class App(Base):
-    __tablename__ = "app"
-    id = Column(Integer, primary_key=True, index=True)
-    usuario_id = Column(Integer, ForeignKey("usuario.id"))
-    nombre = Column(String)
-    paquete = Column(String)
-    categoria = Column(String)
-    limite_aperturas = Column(Integer)
-    usuario = relationship("Usuario", back_populates="apps")
+from app.config import CORS_ORIGINS
+from app.controllers import (
+    app_controller, auth_controller, dominio_controller, estadisticas_controller, evento_controller,
+    franja_controller, pausa_controller, plan_controller, salud_controller, sesion_controller,
+    token_controller, usuario_controller,
+)
+from app.database import sincronizar_esquema
+from app.utils.errores import Conflicto, NoEncontrado
 
-class Franja(Base):
-    __tablename__ = "franja"
-    id = Column(Integer, primary_key=True, index=True)
-    fecha = Column(Date)
-    hora_inicio = Column(String)
-    hora_fin = Column(String)
+logging.basicConfig(level=logging.INFO)
 
-class EventoUso(Base):
-    __tablename__ = "evento_uso"
-    id = Column(Integer, primary_key=True, index=True)
-    app_id = Column(Integer, ForeignKey("app.id"))
-    usuario_id = Column(Integer, ForeignKey("usuario.id"))
-    inicio = Column(DateTime)
-    fin = Column(DateTime)
-    duracion_seg = Column(Integer)
-    franja_id = Column(Integer, ForeignKey("franja.id"))
 
-class Plan(Base):
-    __tablename__ = "plan"
-    id = Column(Integer, primary_key=True, index=True)
-    usuario_id = Column(Integer, ForeignKey("usuario.id"))
-    fecha_inicio = Column(Date)
-    limite_base = Column(Integer)
-    semana_actual = Column(Integer, default=1)
-    activo = Column(Boolean, default=True)
-    ajustes = relationship("AjustePlan", back_populates="plan")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # El ORM crea en la BD las tablas que falten al arrancar el servidor
+    sincronizar_esquema()
+    yield
 
-class AjustePlan(Base):
-    __tablename__ = "ajuste_plan"
-    id = Column(Integer, primary_key=True, index=True)
-    plan_id = Column(Integer, ForeignKey("plan.id"))
-    semana = Column(Integer)
-    uso_meta = Column(Float)
-    adherencia = Column(Float)
-    cambio_pct = Column(Float)
-    fecha = Column(Date, default=date.today)
-    plan = relationship("Plan", back_populates="ajustes")
 
-class Pausa(Base):
-    __tablename__ = "pausa"
-    id = Column(Integer, primary_key=True, index=True)
-    usuario_id = Column(Integer, ForeignKey("usuario.id"))
-    app_id = Column(Integer, ForeignKey("app.id"))
-    tipo = Column(String)
-    duracion_seg = Column(Integer)
-    ignorada = Column(Boolean, default=False)
-    fecha = Column(DateTime, default=datetime.utcnow)
+app = FastAPI(
+    title="Focus! API",
+    version="2.0.0",
+    description=(
+        "Backend de Focus!, app Android para reducir gradualmente el tiempo en pantalla.\n\n"
+        "**Identificación:** las rutas privadas requieren el header `X-Usuario-Id`. "
+        "Los números en las rutas son relativos a ese usuario: "
+        "`GET /pausas/7` con `X-Usuario-Id: 1` devuelve la 7.ª pausa del usuario 1."
+    ),
+    lifespan=lifespan,
+)
 
-class DominioBloqueado(Base):
-    __tablename__ = "dominio_bloqueado"
-    id = Column(Integer, primary_key=True, index=True)
-    usuario_id = Column(Integer, ForeignKey("usuario.id"))
-    dominio = Column(String)
-    activo = Column(Boolean, default=True)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class SesionFoco(Base):
-    __tablename__ = "sesion_foco"
-    id = Column(Integer, primary_key=True, index=True)
-    usuario_id = Column(Integer, ForeignKey("usuario.id"))
-    inicio = Column(DateTime, default=datetime.utcnow)
-    fin = Column(DateTime, nullable=True)
-    duracion_min = Column(Integer)
-    completada = Column(Boolean, default=False)
 
-# Sincronizar esquema desde el servidor
-Base.metadata.create_all(bind=engine)
+# ---------- Errores de negocio -> respuestas HTTP ----------
+@app.exception_handler(NoEncontrado)
+async def manejar_no_encontrado(_: Request, exc: NoEncontrado):
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
 
-# ---------------- SCHEMAS ----------------
-class UsuarioIn(BaseModel):
-    email: str; nombre: str; password: str
-class UsuarioOut(BaseModel):
-    id: int; email: str; nombre: str; activo: bool; foto_url: Optional[str] = None
-    class Config: from_attributes = True
-class LoginIn(BaseModel):
-    email: str; password: str
-class AppIn(BaseModel):
-    nombre: str; paquete: str; categoria: str; limite_aperturas: int
-class AppOut(AppIn):
-    id: int
-    class Config: from_attributes = True
-class EventoIn(BaseModel):
-    app_id: int; inicio: datetime; fin: datetime; duracion_seg: int; franja_id: int
-class EventoOut(EventoIn):
-    id: int
-    class Config: from_attributes = True
-class PlanIn(BaseModel):
-    fecha_inicio: date; limite_base: int
-class AjusteIn(BaseModel):
-    semana: int; uso_meta: float; adherencia: float; cambio_pct: float
-class PausaIn(BaseModel):
-    app_id: int; tipo: str; duracion_seg: int; ignorada: bool = False
-class DominioIn(BaseModel):
-    dominio: str
-class SesionIn(BaseModel):
-    duracion_min: int
-class FotoIn(BaseModel):
-    foto_url: str
 
-def get_db():
-    db = SessionLocal()
-    try: yield db
-    finally: db.close()
+@app.exception_handler(Conflicto)
+async def manejar_conflicto(_: Request, exc: Conflicto):
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
-def get_usuario_id(x_usuario_id: int = Header(..., alias="X-Usuario-Id")) -> int:
-    return x_usuario_id
 
-app = FastAPI(title="Focus! API", version="1.0.0")
+@app.exception_handler(IntegrityError)
+async def manejar_integridad(_: Request, exc: IntegrityError):
+    return JSONResponse(status_code=409, content={"detail": "El registro viola una restricción de la base de datos"})
 
-# ---------------- RUTAS ----------------
-@app.get("/salud")
-def salud(): return {"status": "ok"}
 
-@app.post("/auth/registro", status_code=201)
-def registro(u: UsuarioIn, db: Session = Depends(get_db)):
-    existe = db.query(Usuario).filter(Usuario.email == u.email).first()
-    if existe: raise HTTPException(400, "Email ya registrado")
-    nuevo = Usuario(email=u.email, nombre=u.nombre, password_hash=u.password)
-    db.add(nuevo); db.commit(); db.refresh(nuevo)
-    return {"id": nuevo.id, "token": f"token-{nuevo.id}"}
+# ---------- Controladores ----------
+@app.get("/", include_in_schema=False)
+def inicio():
+    return {"api": "Focus!", "version": "2.0.0", "docs": "/docs", "salud": "/salud"}
 
-@app.post("/auth/login")
-def login(l: LoginIn, db: Session = Depends(get_db)):
-    u = db.query(Usuario).filter(Usuario.email == l.email, Usuario.password_hash == l.password).first()
-    if not u: raise HTTPException(401, "Credenciales incorrectas")
-    return {"token": f"token-{u.id}"}
 
-@app.get("/usuarios/{id}", response_model=UsuarioOut)
-def get_usuario(id: int, db: Session = Depends(get_db)):
-    u = db.get(Usuario, id)
-    if not u: raise HTTPException(404, "No encontrado")
-    return u
-
-@app.put("/usuarios/{id}")
-def update_usuario(id: int, nombre: str, db: Session = Depends(get_db)):
-    u = db.get(Usuario, id)
-    if not u: raise HTTPException(404, "No encontrado")
-    u.nombre = nombre; db.commit(); return {"ok": True}
-
-@app.delete("/usuarios/{id}", status_code=204)
-def delete_usuario(id: int, db: Session = Depends(get_db)):
-    u = db.get(Usuario, id)
-    if not u: raise HTTPException(404, "No encontrado")
-    u.activo = False; db.commit()
-
-@app.post("/apps", status_code=201, response_model=AppOut)
-def crear_app(a: AppIn, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    nueva = App(usuario_id=usuario_id, **a.dict())
-    db.add(nueva); db.commit(); db.refresh(nueva); return nueva
-
-@app.get("/apps", response_model=List[AppOut])
-def listar_apps(usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    return db.query(App).filter(App.usuario_id == usuario_id).all()
-
-@app.get("/apps/{id}", response_model=AppOut)
-def get_app(id: int, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    a = db.query(App).filter(App.id == id, App.usuario_id == usuario_id).first()
-    if not a: raise HTTPException(404, "No encontrada")
-    return a
-
-@app.put("/apps/{id}")
-def update_app(id: int, limite_aperturas: int, db: Session = Depends(get_db)):
-    a = db.get(App, id)
-    if not a: raise HTTPException(404, "No encontrada")
-    a.limite_aperturas = limite_aperturas; db.commit(); return {"ok": True}
-
-@app.delete("/apps/{id}", status_code=204)
-def delete_app(id: int, db: Session = Depends(get_db)):
-    a = db.get(App, id)
-    if not a: raise HTTPException(404, "No encontrada")
-    db.delete(a); db.commit()
-
-@app.post("/eventos", status_code=201, response_model=EventoOut)
-def crear_evento(e: EventoIn, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    nuevo = EventoUso(usuario_id=usuario_id, **e.dict())
-    db.add(nuevo); db.commit(); db.refresh(nuevo); return nuevo
-
-@app.get("/eventos", response_model=List[EventoOut])
-def listar_eventos(franja_id: Optional[int] = None, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    q = db.query(EventoUso).filter(EventoUso.usuario_id == usuario_id)
-    if franja_id: q = q.filter(EventoUso.franja_id == franja_id)
-    return q.all()
-
-@app.get("/eventos/{id}", response_model=EventoOut)
-def get_evento(id: int, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    e = db.query(EventoUso).filter(EventoUso.id == id, EventoUso.usuario_id == usuario_id).first()
-    if not e: raise HTTPException(404, "No encontrado")
-    return e
-
-@app.get("/franjas")
-def listar_franjas(db: Session = Depends(get_db)): return db.query(Franja).all()
-
-@app.post("/planes", status_code=201)
-def crear_plan(pl: PlanIn, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    nuevo = Plan(usuario_id=usuario_id, **pl.dict())
-    db.add(nuevo); db.commit(); db.refresh(nuevo); return {"id": nuevo.id}
-
-@app.get("/planes/activo")
-def plan_activo(usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    pl = db.query(Plan).filter(Plan.activo == True, Plan.usuario_id == usuario_id).first()
-    if not pl: raise HTTPException(404, "Sin plan activo")
-    return {"id": pl.id, "limite_base": pl.limite_base, "semana_actual": pl.semana_actual}
-
-@app.post("/planes/{id}/ajustes", status_code=201)
-def ajuste(id: int, a: AjusteIn, db: Session = Depends(get_db)):
-    pl = db.get(Plan, id)
-    if not pl: raise HTTPException(404, "Plan no encontrado")
-    nuevo = AjustePlan(plan_id=id, **a.dict())
-    db.add(nuevo); db.commit(); return {"ok": True, "cambio_pct": a.cambio_pct}
-
-@app.post("/pausas", status_code=201)
-def registrar_pausa(pa: PausaIn, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    nueva = Pausa(usuario_id=usuario_id, **pa.dict())
-    db.add(nueva); db.commit(); db.refresh(nueva); return {"id": nueva.id}
-
-@app.get("/pausas")
-def historial_pausas(usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    return db.query(Pausa).filter(Pausa.usuario_id == usuario_id).all()
-
-@app.get("/pausas/{id}")
-def get_pausa(id: int, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    p = db.query(Pausa).filter(Pausa.id == id, Pausa.usuario_id == usuario_id).first()
-    if not p: raise HTTPException(404, "No encontrada")
-    return p
-
-@app.post("/dominios", status_code=201)
-def agregar_dominio(d: DominioIn, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    nuevo = DominioBloqueado(usuario_id=usuario_id, dominio=d.dominio)
-    db.add(nuevo); db.commit(); db.refresh(nuevo); return {"id": nuevo.id}
-
-@app.get("/dominios")
-def listar_dominios(usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    return db.query(DominioBloqueado).filter(DominioBloqueado.usuario_id == usuario_id).all()
-
-@app.get("/dominios/{id}")
-def get_dominio(id: int, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    d = db.query(DominioBloqueado).filter(DominioBloqueado.id == id, DominioBloqueado.usuario_id == usuario_id).first()
-    if not d: raise HTTPException(404, "No encontrado")
-    return d
-
-@app.delete("/dominios/{id}", status_code=204)
-def eliminar_dominio(id: int, db: Session = Depends(get_db)):
-    d = db.get(DominioBloqueado, id)
-    if not d: raise HTTPException(404, "No encontrado")
-    db.delete(d); db.commit()
-
-@app.post("/sesiones-foco", status_code=201)
-def iniciar_sesion(s: SesionIn, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    nueva = SesionFoco(usuario_id=usuario_id, duracion_min=s.duracion_min)
-    db.add(nueva); db.commit(); db.refresh(nueva); return {"id": nueva.id}
-
-@app.put("/sesiones-foco/{id}")
-def cerrar_sesion(id: int, completada: bool = True, db: Session = Depends(get_db)):
-    s = db.get(SesionFoco, id)
-    if not s: raise HTTPException(404, "No encontrada")
-    s.fin = datetime.utcnow(); s.completada = completada; db.commit(); return {"ok": True}
-
-@app.get("/sesiones-foco/{id}")
-def get_sesion(id: int, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    s = db.query(SesionFoco).filter(SesionFoco.id == id, SesionFoco.usuario_id == usuario_id).first()
-    if not s: raise HTTPException(404, "No encontrada")
-    return s
-
-@app.get("/estadisticas")
-def estadisticas(usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    return {
-        "total_eventos": db.query(EventoUso).filter(EventoUso.usuario_id == usuario_id).count(),
-        "total_apps": db.query(App).filter(App.usuario_id == usuario_id).count(),
-        "pausas_ignoradas": db.query(Pausa).filter(Pausa.usuario_id == usuario_id, Pausa.ignorada == True).count(),
-        "sesiones_foco_completadas": db.query(SesionFoco).filter(SesionFoco.usuario_id == usuario_id, SesionFoco.completada == True).count(),
-    }
-
-@app.post("/usuarios/foto")
-def subir_foto(f: FotoIn, usuario_id: int = Depends(get_usuario_id), db: Session = Depends(get_db)):
-    u = db.get(Usuario, usuario_id)
-    if not u: raise HTTPException(404, "Usuario no encontrado")
-    u.foto_url = f.foto_url; db.commit()
-    return {"ok": True, "foto_url": u.foto_url}
+for modulo in (
+    salud_controller, auth_controller, usuario_controller, app_controller, evento_controller,
+    franja_controller, plan_controller, pausa_controller, dominio_controller, sesion_controller,
+    token_controller, estadisticas_controller,
+):
+    app.include_router(modulo.router)
