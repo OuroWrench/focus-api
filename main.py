@@ -16,18 +16,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from app.config import CORS_ORIGINS
 from app.controllers import (
-    app_controller, auth_controller, dominio_controller, estadisticas_controller, evento_controller,
-    franja_controller, pausa_controller, plan_controller, salud_controller, sesion_controller,
-    token_controller, usuario_controller,
+    app_controller, auth_controller, companero_controller, dominio_controller, estadisticas_controller,
+    evento_controller, franja_controller, pausa_controller, plan_controller, riesgo_controller,
+    salud_controller, sesion_controller, token_controller, usuario_controller,
 )
 from app.database import sincronizar_esquema
 from app.utils.errores import Conflicto, NoEncontrado
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("focus.api")
 
 
 @asynccontextmanager
@@ -73,6 +74,17 @@ async def manejar_integridad(_: Request, exc: IntegrityError):
     return JSONResponse(status_code=409, content={"detail": "El registro viola una restricción de la base de datos"})
 
 
+@app.exception_handler(DBAPIError)
+async def manejar_bd_no_disponible(_: Request, exc: DBAPIError):
+    # Azure SQL serverless se pausa tras 1 h sin uso; la primera petición falla mientras despierta
+    log.warning("Base de datos no disponible: %s", exc.orig)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "30"},
+        content={"detail": "La base de datos se está iniciando; reintenta en unos 30 segundos"},
+    )
+
+
 # ---------- Controladores ----------
 @app.get("/", include_in_schema=False)
 def inicio():
@@ -82,6 +94,6 @@ def inicio():
 for modulo in (
     salud_controller, auth_controller, usuario_controller, app_controller, evento_controller,
     franja_controller, plan_controller, pausa_controller, dominio_controller, sesion_controller,
-    token_controller, estadisticas_controller,
+    token_controller, estadisticas_controller, riesgo_controller, companero_controller,
 ):
     app.include_router(modulo.router)
